@@ -1,250 +1,187 @@
-import io
-import numpy as np
-from PIL import Image
+# app.py
 import streamlit as st
-
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision import transforms as T
-import timm
+from torchvision import models, transforms
+import os
 
-# ==============================
-# Helpers
-# ==============================
+# --- Konfigurasi Utama ---
+# Ganti path ini sesuai dengan lokasi model Anda
+  # Folder root eksperimen
+ARCH = "resnet50"           # Ganti ke "resnext50" jika model Anda adalah ResNeXt
+CKPT = "best_weights.pt"
 
-IMSIZE = 224
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD  = (0.229, 0.224, 0.225)
+# Ganti dengan ukuran gambar yang digunakan saat pelatihan
+IMG_SIZE = 224
+# Mean dan Std ImageNet, biasanya tidak berubah jika tidak disesuaikan
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
 
-def build_preprocess(img_size=IMSIZE):
-    return T.Compose([
-        T.Resize((img_size, img_size)),
-        T.ToTensor(),
-        T.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-    ])
+# INI PENTING: Ganti dengan NAMA KELAS yang sesuai dengan model Anda, dalam urutan indeks
+# Misalnya, jika model Anda memprediksi ["Cat", "Dog", "Bird"], maka:
+# CLASS_NAMES = ["Cat", "Dog", "Bird"]
+CLASS_NAMES = ['DiabeticFootUlcer', 'Normal(Healthy skin)', 'Pressure Ulcer']
 
-def get_target_layer(model: nn.Module, arch: str) -> nn.Module:
-    """Pick a reasonable last conv layer for Grad-CAM depending on architecture.
-    Falls back to the last Conv2d found if specific mapping fails.
-    """
-    try:
-        low = arch.lower()
-        if "resnet" in low or "resnext" in low:
-            # timm's resnet/resnext keep layer4 blocks compatible
-            return model.layer4[-1].conv3
-        if "efficientnet" in low:
-            # timm efficientnet has conv_head at the end
-            return model.conv_head
-    except Exception:
-        pass
+NUM_CLASSES = len(CLASS_NAMES)
 
-    # Fallback: last conv found
-    last = None
-    for m in model.modules():
-        if isinstance(m, nn.Conv2d):
-            last = m
-    if last is None:
-        raise RuntimeError("Tidak menemukan layer konvolusi untuk Grad-CAM.")
-    return last
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Streamlit app akan menggunakan device: {DEVICE}")
 
-@st.cache_resource(show_spinner=False)
-def load_model(arch: str, num_classes: int, state_dict_bytes: bytes | None):
-    """Create a timm model and (optionally) load user-provided weights.
-    Returns (model, target_layer) on CPU, eval mode.
-    """
-    # Create model
-    try:
-        model = timm.create_model(arch, pretrained=True, num_classes=num_classes)
-    except Exception as e:
-        st.error(f"Gagal membuat model untuk arsitektur '{arch}': {e}")
-        raise
+# --- Transformasi ---
+eval_tfms = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+])
 
-    # Load weights if provided
-    if state_dict_bytes:
-        try:
-            buffer = io.BytesIO(state_dict_bytes)
-            state_dict = torch.load(buffer, map_location="cpu")
-            # Some checkpoints wrap with {"model": state_dict, ...}
-            if isinstance(state_dict, dict) and "state_dict" in state_dict and isinstance(state_dict["state_dict"], dict):
-                state_dict = state_dict["state_dict"]
-            if isinstance(state_dict, dict) and "model_state" in state_dict and isinstance(state_dict["model_state"], dict):
-                state_dict = state_dict["model_state"]
-            missing, unexpected = model.load_state_dict(state_dict, strict=False)
-            if missing or unexpected:
-                st.warning(
-                    "Peringatan saat memuat bobot (strict=False):\n"
-                    f"- Missing keys: {len(missing)}\n"
-                    f"- Unexpected keys: {len(unexpected)}"
-                )
-            st.success("✅ Bobot kustom berhasil dimuat.")
-        except Exception as e:
-            st.error(f"Gagal memuat bobot kustom (.pth/.pt): {e}")
-            st.stop()
+# --- Fungsi Load Model ---
+def build_model_from_arch(arch: str, num_classes: int):
+    if arch == "resnet50":
+        m = models.resnet50(weights=None)
+        m.fc = nn.Linear(m.fc.in_features, num_classes)
+        target_layer = m.layer4[-1].conv3  # Atau m.layer4[-1] jika conv3 tidak ada
+    elif arch == "resnext50":
+        m = models.resnext50_32x4d(weights=None)
+        m.fc = nn.Linear(m.fc.in_features, num_classes)
+        target_layer = m.layer4[-1].conv3
+    else:
+        raise ValueError("arch tidak dikenal (pakai 'resnet50' / 'resnext50')")
+    return m.to(DEVICE).eval(), target_layer
 
+def _strip_module_prefix(state_dict):
+    if all(k.startswith("module.") for k in state_dict.keys()):
+        return {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+    return state_dict
+
+def load_weights(model, ckpt_path):
+    if not os.path.exists(ckpt_path):
+        st.error(f"Checkpoint tidak ditemukan di path: {ckpt_path}")
+        st.stop()
+    state = torch.load(ckpt_path, map_location=DEVICE)
+    state_dict = state.get("model", state) if isinstance(state, dict) else state
+    state_dict = _strip_module_prefix(state_dict)
+    model.load_state_dict(state_dict, strict=True)
+    return model
+
+# --- Inisialisasi Model dan GradCAM ---
+@st.cache_resource  # Gunakan cache untuk memuat model sekali saja
+def load_model_and_layer():
+    model, target_layer = build_model_from_arch(ARCH, NUM_CLASSES)
+    model = load_weights(model, CKPT)
     model.eval()
-    target_layer = get_target_layer(model, arch)
     return model, target_layer
 
-def softmax_probs(logits: torch.Tensor) -> torch.Tensor:
-    return F.softmax(logits, dim=-1)
+model, target_layer = load_model_and_layer()
+st.success(f"Model {ARCH} berhasil dimuat dari {CKPT}")
 
-def to_pil(img_tensor: torch.Tensor) -> Image.Image:
-    """img_tensor: (C,H,W) in 0..1 (unnormalized)."""
-    img = img_tensor.clone().detach()
-    img = torch.clamp(img, 0, 1)
-    img = (img * 255).byte().permute(1, 2, 0).cpu().numpy()
-    return Image.fromarray(img)
+# --- Kelas GradCAM ---
+class GradCAM:
+    def __init__(self, model, target_layer):
+        self.model = model.eval()
+        self.target_layer = target_layer
+        self.activations = None
+        self.gradients = None
+        self.h_fwd = self.target_layer.register_forward_hook(self._fwd_hook)
+        self.h_bwd = self.target_layer.register_full_backward_hook(self._bwd_hook)
 
-def denormalize(img_tensor: torch.Tensor) -> torch.Tensor:
-    """Reverse ImageNet normalization for visualization."""
-    mean = torch.tensor(IMAGENET_MEAN).view(3,1,1)
-    std  = torch.tensor(IMAGENET_STD).view(3,1,1)
-    return img_tensor * std + mean
+    def _fwd_hook(self, module, inp, out):
+        self.activations = out.detach()
 
-def gradcam_heatmap(model: nn.Module, target_layer: nn.Module, inp: torch.Tensor, class_idx: int | None):
-    """Compute Grad-CAM heatmap for a single input (1,C,H,W)."""
-    activations = []
-    gradients = []
+    def _bwd_hook(self, module, grad_in, grad_out):
+        self.gradients = grad_out[0].detach()
 
-    def fwd_hook(_, __, output):
-        activations.append(output.detach())
+    def __call__(self, x, class_idx=None):
+        self.model.zero_grad(set_to_none=True)
+        logits = self.model(x)
+        if class_idx is None:
+            class_idx = int(logits.argmax(1).item())
+        score = logits[0, class_idx]
+        score.backward(retain_graph=True)
+        acts  = self.activations
+        grads = self.gradients
+        weights = grads.mean(dim=(2,3), keepdim=True)
+        cam = (weights * acts).sum(dim=1).relu().squeeze(0).cpu().numpy()
+        cam -= cam.min()
+        if cam.max() > 0: cam /= cam.max()
+        probs = torch.softmax(logits, dim=1)[0].detach().cpu().numpy()
+        return cam, class_idx, probs
 
-    def bwd_hook(_, grad_in, grad_out):
-        gradients.append(grad_out[0].detach())
+    def remove(self):
+        self.h_fwd.remove()
+        self.h_bwd.remove()
 
-    h1 = target_layer.register_forward_hook(fwd_hook)
-    h2 = target_layer.register_full_backward_hook(bwd_hook)
-
-    logits = model(inp)  # (1, num_classes)
-    if class_idx is None:
-        class_idx = int(logits.argmax(dim=-1).item())
-
-    score = logits[:, class_idx].sum()
-    model.zero_grad(set_to_none=True)
-    score.backward()
-
-    # Clean hooks
-    h1.remove()
-    h2.remove()
-
-    if not activations or not gradients:
-        raise RuntimeError("Gagal mengambil aktivasi/gradien untuk Grad-CAM.")
-
-    A = activations[0]            # (1, C, H', W')
-    dA = gradients[0]             # (1, C, H', W')
-    weights = dA.mean(dim=(2,3), keepdim=True)  # (1, C, 1, 1)
-    cam = (weights * A).sum(dim=1, keepdim=True)  # (1, 1, H', W')
-    cam = F.relu(cam)
-    cam = cam - cam.min()
-    if cam.max() > 0:
-        cam = cam / cam.max()
-    cam = F.interpolate(cam, size=inp.shape[2:], mode="bilinear", align_corners=False)  # (1,1,H,W)
-    cam = cam.squeeze().cpu().numpy()  # (H,W)
-    return logits.detach().cpu(), cam
-
-def overlay_heatmap(pil_img: Image.Image, heatmap: np.ndarray, alpha: float = 0.35) -> Image.Image:
-    """Overlay a heatmap (0..1) on a PIL image using matplotlib colormap."""
+# --- Fungsi Overlay ---
+def overlay_cam_on_pil(pil_img, cam, alpha=0.35):
     import matplotlib.cm as cm
+    w, h = pil_img.size
+    cam_resized = (cam * 255).astype(np.uint8)
+    cam_img = Image.fromarray(cam_resized).resize((w, h), Image.BILINEAR)
+    # Konversi heatmap ke RGB
+    heatmap_jet = cm.jet(np.array(cam_img)/255.0)
+    # Ambil hanya 3 channel RGB, buang alpha
+    heat_rgb = (heatmap_jet[:, :, :3] * 255).astype(np.uint8)
+    base = np.array(pil_img).astype(np.uint8)
+    overlay = (alpha * heat_rgb + (1 - alpha) * base).astype(np.uint8)
+    return Image.fromarray(overlay)
 
-    base = pil_img.convert("RGB").resize((heatmap.shape[1], heatmap.shape[0]))
-    heat = np.uint8(cm.jet(heatmap) * 255)  # RGBA
-    heat_rgb = Image.fromarray(heat[:, :, :3]).convert("RGB")
-    return Image.blend(base, heat_rgb, alpha=alpha)
 
-def predict_one(image: Image.Image, model, target_layer, preprocess, class_names):
-    # Keep a copy for visualization
-    img_vis = image.copy().convert("RGB")
-    # Preprocess
-    x = preprocess(img_vis).unsqueeze(0)  # (1,C,H,W)
-    with torch.no_grad():
-        logits = model(x)
-    probs = softmax_probs(logits)[0].cpu().numpy()
+# --- UI Streamlit ---
+st.title("Demo: Klasifikasi Gambar & Grad-CAM")
+st.write(f"Model yang digunakan: `{ARCH}` | Kelas: `{CLASS_NAMES}`")
 
-    # Grad-CAM (use top-1 class)
-    logits_gc, cam = gradcam_heatmap(model, target_layer, x, None)
-    topk = int(min(3, len(class_names)))
-    top_idx = probs.argsort()[::-1][:topk]
-    top = [(class_names[i], float(probs[i])) for i in top_idx]
+uploaded_file = st.file_uploader("Pilih gambar untuk diprediksi...", type=["jpg", "jpeg", "png"])
 
-    # Build overlay image (denormalize x for background)
-    x_denorm = denormalize(x[0].cpu())
-    bg = to_pil(x_denorm)
-    over = overlay_heatmap(bg, cam, alpha=0.35)
-    return top, over
+if uploaded_file is not None:
+    image = Image.open(uploaded_file).convert("RGB")
+    st.image(image, caption='Gambar yang Diunggah', use_container_width=True)
 
-# ==============================
-# Streamlit UI
-# ==============================
+    if st.button('Klasifikasikan & Tampilkan Grad-CAM'):
+        with st.spinner('Memproses...'):
+            # Prediksi
+            x = eval_tfms(image).unsqueeze(0).to(DEVICE)
+            with torch.no_grad():
+                logits = model(x)
+                probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
+                predicted_idx = int(logits.argmax(1).item())
+                confidence = float(probs[predicted_idx])
 
-st.set_page_config(page_title="CNN Inference + Grad-CAM", page_icon="🧠", layout="wide")
-st.title("🧠 CNN Image Classifier with Grad‑CAM (PyTorch + timm)")
+            # GradCAM
+            cam_engine = GradCAM(model, target_layer)
+            cam, cls_idx, _ = cam_engine(x, class_idx=predicted_idx) # Gunakan prediksi
+            cam_engine.remove()
 
-with st.sidebar:
-    st.header("⚙️ Konfigurasi")
-    arch = st.selectbox(
-        "Arsitektur",
-        options=["resnet50", "resnext50_32x4d", "efficientnet_b0"],
-        index=0,
-        help="Gunakan arsitektur yang sama dengan yang dipakai saat training bobotmu."
-    )
+            # Hasil
+            predicted_class_name = CLASS_NAMES[predicted_idx]
+            st.subheader("Hasil Prediksi")
+            st.write(f"**Kelas Prediksi:** {predicted_class_name}")
+            st.write(f"**Confidence:** {confidence:.4f}")
 
-    st.caption("**Kelas** — pisahkan dengan koma, urut sesuai saat training.")
-    classes_text = st.text_area(
-        "Daftar kelas",
-        value="Class0, Class1, Class2",
-        height=80
-    )
-    class_names = [c.strip() for c in classes_text.split(",") if c.strip()]
-    if len(class_names) < 2:
-        st.warning("Minimal 2 kelas.")
-    num_classes = len(class_names)
+            # Visualisasi GradCAM
+            overlay_image = overlay_cam_on_pil(image, cam, alpha=0.4)
 
-    weights_file = st.file_uploader(
-        "Upload bobot (.pth / .pt) — opsional",
-        type=["pth", "pt"],
-        help="Jika dikosongkan: pakai pre-trained ImageNet (head num_classes disesuaikan)."
-    )
-    st.info("Catatan: Bobot harus cocok dengan arsitektur yang dipilih. App memuat dengan strict=False untuk toleransi perbedaan kecil.")
+            st.subheader("Visualisasi Grad-CAM")
+            st.write(f"Grad-CAM untuk kelas: **{CLASS_NAMES[cls_idx]}**")
 
-    img_size = st.number_input("Ukuran input (px)", min_value=128, max_value=640, value=IMSIZE, step=32)
-    preprocess = build_preprocess(img_size)
+            fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+            ax[0].imshow(image)
+            ax[0].set_title("Gambar Input")
+            ax[0].axis('off')
+            ax[1].imshow(overlay_image)
+            ax[1].set_title(f"Grad-CAM -> {CLASS_NAMES[cls_idx]}")
+            ax[1].axis('off')
+            st.pyplot(fig)
 
-model, target_layer = load_model(
-    arch=arch,
-    num_classes=num_classes,
-    state_dict_bytes=(weights_file.read() if weights_file is not None else None)
-)
+            # Plot probabilitas kelas
+            st.subheader("Probabilitas untuk Setiap Kelas")
+            fig2, ax2 = plt.subplots()
+            ax2.barh(CLASS_NAMES, probs)
+            ax2.set_xlabel("Probabilitas")
+            ax2.set_title("Probabilitas Kelas")
+            st.pyplot(fig2)
 
-st.success(f"Model **{arch}** siap • num_classes={num_classes}")
-
-imgs = st.file_uploader("Unggah gambar untuk prediksi", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
-if not imgs:
-    st.stop()
-
-cols = st.columns(2, gap="large")
-left, right = cols
-
-with left:
-    st.subheader("📥 Gambar Masukan")
-    for up in imgs:
-        st.image(Image.open(up).convert("RGB"), caption=up.name, use_container_width=True)
-
-with right:
-    st.subheader("🔮 Prediksi & Grad‑CAM")
-    for up in imgs:
-        img = Image.open(up).convert("RGB")
-        try:
-            top, over = predict_one(img, model, target_layer, preprocess, class_names)
-        except Exception as e:
-            st.error(f"Gagal memproses {up.name}: {e}")
-            continue
-
-        st.markdown(f"**{up.name}**")
-        # Show top-k
-        for cname, p in top:
-            st.write(f"- {cname}: {p:.4f}")
-        st.image(over, caption="Grad‑CAM overlay", use_container_width=True)
-        st.divider()
-
-st.caption("💡 Tips deployment: `streamlit run app.py` di lokal, atau deploy ke Streamlit Cloud. Pastikan `requirements.txt` sesuai.")
+else:
+    st.info("Silakan unggah file gambar (JPG, PNG).")
