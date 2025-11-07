@@ -320,6 +320,15 @@ if uploaded_file is not None:
     with predict_col1:
         run_pred = st.button("🚀 Klasifikasikan & Tampilkan Grad-CAM")
 
+    with predict_col2:
+        thr = st.slider(
+            "Confidence threshold (opsional, untuk interpretasi pribadi)",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.5,
+            step=0.05
+        )
+
     if run_pred:
         with st.spinner("Menghitung prediksi & Grad-CAM..."):
             x = eval_tfms(proc_image).unsqueeze(0).to(DEVICE)
